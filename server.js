@@ -1,6 +1,6 @@
 /**
  * Thanawya World API — Protected Backend
- * VERSION v1.7.9 — shared video sessions + 7 retries + 4 videos/min
+ * VERSION v1.7.12 — math from Coursatk only + anti-bulk-download + 4 videos/min
  */
 import express from "express";
 import cors from "cors";
@@ -46,7 +46,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 const TEMP_DIR = path.join(DATA_DIR, "temp_files");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); fs.mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.7.9";
+const APP_VERSION = "v1.7.12";
 
 process.on("unhandledRejection", (r) => console.error("[unhandledRejection]", (r && r.stack) || r));
 process.on("uncaughtException", (e) => console.error("[uncaughtException]", (e && e.stack) || e));
@@ -1327,7 +1327,9 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
 
 app.use(rateLimit({ max: 1500, windowMs: 60_000, scope: "global", skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/hls/") || req.path === "/health" }));
 app.use("/api/stream/", rateLimit({ max: 1500, windowMs: 60_000, scope: "stream", keyFn: (req) => "t:" + (getBearer(req) || clientIp(req)) }));
-app.use("/api/hls/", rateLimit({ max: 1500, windowMs: 60_000, scope: "stream", keyFn: (req) => "t:" + (getBearer(req) || clientIp(req)) }));
+// حد المقاطع: يمنع سحب المحاضرة كاملة بسرعة من سكربت/منصة تانية
+app.use("/api/hls/", rateLimit({ max: Number(process.env.HLS_RATE_MAX || 420), windowMs: 60_000, scope: "hls-seg", keyFn: (req) => "t:" + (getBearer(req) || clientIp(req)), message: "طلبات بث كثيرة — هدّي شوية" }));
+app.use("/api/play/", rateLimit({ max: Number(process.env.PLAY_RATE_MAX || 30), windowMs: 60_000, scope: "play-api", keyFn: (req) => "t:" + (getBearer(req) || clientIp(req)), message: "طلبات تشغيل كثيرة" }));
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -2647,7 +2649,9 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
     let results = await Promise.all(wantedIds.map((sid, idx) => resolveOne(sid).then((s) => ({ ...s, order_index: idx + 1 }))));
 
-    if (CONFIG.THANAWICA_ENABLED && studentAllowsThanawica(req.student)) {
+    // الرياضة من كورساتك فقط — مش بنستبدلها بمادة ثانويكا
+    // لو حابب ترجع الاستبدال: THANAWICA_REPLACE_MATH=1
+    if (CONFIG.THANAWICA_ENABLED && process.env.THANAWICA_REPLACE_MATH === "1" && studentAllowsThanawica(req.student)) {
       try {
         const thList = await thSubjectsForYear(yearId);
         const thMath = thList.find((s) => s._kind === "math") || null;
@@ -3008,6 +3012,41 @@ function getSharedPlay(videoId) {
   return s;
 }
 
+
+// حماية من السحب: السماح بتشغيل الـ HLS من دومينات موقعك فقط (أو بدون Origin مثل بعض مشغّلات الموبايل)
+function assertPlayerOrigin(req) {
+  const strict = process.env.PLAYER_ORIGIN_STRICT !== "0"; // افتراضي صارم
+  if (!strict) return true;
+  const origin = String(req.headers.origin || "").replace(/\/$/, "");
+  const referer = String(req.headers.referer || "");
+  // طلبات السيرفر لنفسها / أدوات بلا Origin
+  if (!origin && !referer) return true;
+  const allowed = ALLOWED_ORIGINS;
+  if (origin && allowed.has(origin)) return true;
+  if (referer) {
+    try {
+      const h = new URL(referer).origin;
+      if (allowed.has(h)) return true;
+    } catch {}
+  }
+  // www وغير www لنفس الدومين
+  const extras = new Set([
+    "https://www.durosakplus.com",
+    "https://durosakplus.com",
+    "http://www.durosakplus.com",
+    "http://durosakplus.com",
+    "https://unique-transformation-production-ceaf.up.railway.app",
+    ...String(process.env.ALLOWED_ORIGINS || "").split(",").map((x) => x.trim().replace(/\/$/, "")).filter(Boolean)
+  ]);
+  if (origin && extras.has(origin)) return true;
+  if (referer) {
+    try { if (extras.has(new URL(referer).origin)) return true; } catch {}
+  }
+  const e = new Error("غير مصرح — التشغيل من هذا الموقع غير مسموح");
+  e.status = 403;
+  throw e;
+}
+
 function assertStreamOwner(session, req) {
   if (!session) { const e = new Error("انتهت صلاحية التشغيل"); e.status = 404; throw e; }
   const sk = req.query.sk || req.headers["x-stream-key"];
@@ -3018,20 +3057,25 @@ function assertStreamOwner(session, req) {
       throw e;
     }
   }
-  // جلسة مشتركة: أي طالب مسجّل دخوله يقدر يشغّل بنفس الرابط
-  if (session.shared) {
-    if (!req.sessionToken && !(req.session && req.session.code)) {
-      const e = new Error("مطلوب تسجيل الدخول");
-      e.status = 401;
-      throw e;
-    }
-    session.lastUsed = now();
-    return true;
-  }
+  // لازم تسجيل دخول + نفس صاحب الجلسة (يمنع مشاركة لينك التشغيل بين منصات/حسابات)
   const code = req.session && req.session.code;
   const token = req.sessionToken;
-  if (!code || session.ownerCode !== code) { const e = new Error("غير مصرح — الرابط ده مش لحسابك"); e.status = 403; throw e; }
-  if (session.ownerToken && token && session.ownerToken !== token) { const e = new Error("غير مصرح — افتح الفيديو من جديد"); e.status = 403; throw e; }
+  if (!code || !token) {
+    const e = new Error("مطلوب تسجيل الدخول");
+    e.status = 401;
+    throw e;
+  }
+  if (session.ownerCode && session.ownerCode !== code) {
+    const e = new Error("غير مصرح — الرابط ده مش لحسابك");
+    e.status = 403;
+    throw e;
+  }
+  if (session.ownerToken && session.ownerToken !== token) {
+    const e = new Error("غير مصرح — افتح الفيديو من جديد");
+    e.status = 403;
+    throw e;
+  }
+  session.lastUsed = now();
   return true;
 }
 
@@ -3133,6 +3177,67 @@ const playLimiter = rateLimit({
   message: "وصلت للحد الأقصى: 4 فيديوهات في الدقيقة — استنى شوية وجرّب تاني"
 });
 
+// حماية من السحب الجماعي: أكتر من N فيديو مختلف في 10 دقايق → إيقاف مؤقت
+// (من غير تبطئة سرعة المشاهدة العادية)
+const PLAY_BURST_WINDOW_MS = Number(process.env.PLAY_BURST_WINDOW_MS || 10 * 60_000);
+const PLAY_BURST_MAX = Number(process.env.PLAY_BURST_MAX || 8);
+const PLAY_BURST_BAN_MS = Number(process.env.PLAY_BURST_BAN_MS || 15 * 60_000);
+const playBurst = new Map(); // code -> { ids: Map<videoId,ts>, bannedUntil }
+
+function checkPlayBurst(code, videoId) {
+  const c = String(code || "unknown");
+  const vid = String(videoId || "");
+  const t = Date.now();
+  let row = playBurst.get(c);
+  if (!row) {
+    row = { ids: new Map(), bannedUntil: 0 };
+    playBurst.set(c, row);
+  }
+  if (row.bannedUntil > t) {
+    const sec = Math.ceil((row.bannedUntil - t) / 1000);
+    const e = new Error(`تم إيقاف التشغيل مؤقتًا بسبب طلبات كثيرة — حاول بعد ${sec} ثانية`);
+    e.status = 429;
+    throw e;
+  }
+  for (const [id, ts] of [...row.ids.entries()]) {
+    if (t - ts > PLAY_BURST_WINDOW_MS) row.ids.delete(id);
+  }
+  if (!row.ids.has(vid)) {
+    if (row.ids.size >= PLAY_BURST_MAX) {
+      row.bannedUntil = t + PLAY_BURST_BAN_MS;
+      console.warn("[play-burst] ban", c, "videos", row.ids.size, "windowMs", PLAY_BURST_WINDOW_MS);
+      const e = new Error("طلبت فيديوهات كتير في وقت قصير. التشغيل متوقف ربع ساعة لحماية المحتوى.");
+      e.status = 429;
+      throw e;
+    }
+    row.ids.set(vid, t);
+  } else {
+    row.ids.set(vid, t);
+  }
+}
+
+async function logPlayEvent(req, videoId) {
+  try {
+    const code = (req.session && req.session.code) || "unknown";
+    const entry = {
+      code: String(code),
+      videoId: String(videoId || ""),
+      ip: clientIp(req),
+      deviceId: (req.session && req.session.deviceId) || null,
+      ua: String(req.headers["user-agent"] || "").slice(0, 180),
+      at: Date.now()
+    };
+    console.log("[play-log]", entry.code, entry.videoId, entry.ip);
+    if (getFirebaseUrl()) {
+      const safeVid = String(videoId || "x").replace(/[^\w-]/g, "").slice(0, 48) || "x";
+      await fbSet(`play_logs/${entry.code}/${entry.at}_${safeVid}`, entry);
+    }
+  } catch (e) {
+    console.warn("[play-log]", e.message);
+  }
+}
+
+
 app.post("/api/play/:videoId", requireStudent, playLimiter, async (req, res) => {
   try {
     let videoId = String(req.params.videoId);
@@ -3152,6 +3257,12 @@ app.post("/api/play/:videoId", requireStudent, playLimiter, async (req, res) => 
       }
     }
     if (/^th[pvmy]_/i.test(videoId) && !studentAllowsThanawica(req.student)) return jsonError(res, 403, "المصدر غير متاح لشعبتك");
+    try {
+      checkPlayBurst(req.session && req.session.code, videoId);
+    } catch (be) {
+      return jsonError(res, be.status || 429, be.message || "طلبات كثيرة");
+    }
+    logPlayEvent(req, videoId).catch(() => {});
     const src = await getVideoSource(videoId, req.headers);
 
     try {
@@ -3163,46 +3274,31 @@ app.post("/api/play/:videoId", requireStudent, playLimiter, async (req, res) => 
     if (src.youtubeUrl) return res.json({ success: true, data: { type: "youtube", youtube_url: src.youtubeUrl, url: src.youtubeUrl } });
     if (src.mode === "thanawica-mp4" && src.mp4Url) return res.json({ success: true, data: { type: "mp4", play_url: src.mp4Url, mp4_url: src.mp4Url } });
 
-    // إعادة استخدام جلسة تشغيل مشتركة لنفس فيديو كورساتك (كل المستخدمين)
-    const shareKeys = [String(src.videoId || ""), String(src.reqVideoId || ""), String(videoId || "")].filter(Boolean);
-    let sessionRow = null;
-    for (const k of shareKeys) {
-      sessionRow = getSharedPlay(k);
-      if (sessionRow) break;
-    }
-    if (sessionRow && sessionRow.src) {
-      // حدّث المصدر لو اتعمل refresh في الكاش
-      try {
-        const hit = sourceCache.get(String(src.reqVideoId || src.videoId || videoId));
-        if (hit && hit.src) sessionRow.src = hit.src;
-      } catch {}
-      touchSharedPlay(sessionRow);
-      const hlsPath = `/api/hls/${sessionRow.id}/master.m3u8?sk=${sessionRow.streamKey}`;
-      return res.json({ success: true, data: { play_url: hlsPath, manifest_url: hlsPath, shared: true } });
-    }
+    // مصدر كورساتك مشترك في الذاكرة (sourceCache) — لكن جلسة HLS خاصة بكل طالب
+    // عشان لينك التشغيل ومتفتاح sk ميترموش بين منصات تانية
+    assertPlayerOrigin(req);
 
     const id = crypto.randomUUID().replace(/-/g, "");
     const streamKey = crypto.randomBytes(16).toString("hex");
     const deviceId = (req.session && req.session.deviceId) || (req.student && req.student.deviceId) || null;
     revokeOtherSessions(req.session.code, src.videoId, id);
 
-    sessionRow = {
+    const sessionRow = {
       id,
       src,
       videoId: src.videoId,
-      shared: true,
-      ownerCode: null,
-      ownerToken: null,
+      shared: false,
+      ownerCode: req.session.code,
+      ownerToken: req.sessionToken,
       ownerDeviceId: deviceId,
       streamKey,
       createdAt: now(),
       lastUsed: now()
     };
     streamSessions.set(id, sessionRow);
-    touchSharedPlay(sessionRow);
-    // مش بنكتب Firebase لكل مشاهد — الجلسة المشتركة في الذاكرة أسرع وأخف
+    // بدون persist Firebase لتقليل التسريب والكتابة — الجلسة في الذاكرة فقط
     const hlsPath = `/api/hls/${id}/master.m3u8?sk=${streamKey}`;
-    res.json({ success: true, data: { play_url: hlsPath, manifest_url: hlsPath, shared: true } });
+    res.json({ success: true, data: { play_url: hlsPath, manifest_url: hlsPath, shared: false } });
   } catch (e) {
     try { const yt = await tryResolveYoutube(String(req.params.videoId || "")); if (yt) return res.json({ success: true, data: { type: "youtube", youtube_url: yt, url: yt } }); } catch {}
     console.error("[play]", e.message);
@@ -3254,18 +3350,22 @@ function playlistBodyFromSession(session) {
 
 app.get("/api/hls/:pid/key", requireStudent, async (req, res) => {
   try {
+    assertPlayerOrigin(req);
     const session = await getStreamSession(req.params.pid);
     assertStreamOwner(session, req);
     const key = session.src && session.src.plainKey;
     if (!key || !Buffer.isBuffer(key) || key.length !== 16) {
       return jsonError(res, 404, "مفتاح التشفير غير متاح");
     }
+    const allowOrigin = (req.headers.origin && ALLOWED_ORIGINS.has(String(req.headers.origin).replace(/\/$/, ""))) ? req.headers.origin : (ALLOWED_ORIGINS.values().next().value || "https://www.durosakplus.com");
     res.set({
       "Content-Type": "application/octet-stream",
       "Content-Length": "16",
-      "Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": req.headers.origin || "*",
-      "Access-Control-Allow-Credentials": "true"
+      "Cache-Control": "no-store, no-transform",
+      "X-Content-Type-Options": "nosniff",
+      "Access-Control-Allow-Origin": allowOrigin,
+      "Access-Control-Allow-Credentials": "true",
+      "Vary": "Origin"
     });
     res.status(200).send(key);
   } catch (e) {
@@ -3276,6 +3376,7 @@ app.get("/api/hls/:pid/key", requireStudent, async (req, res) => {
 
 app.get("/api/hls/:pid/master.m3u8", requireStudent, async (req, res) => {
   try {
+    assertPlayerOrigin(req);
     const session = await getStreamSession(req.params.pid);
     assertStreamOwner(session, req);
     if (!session.src) return jsonError(res, 410, "جلسة التشغيل ناقصة — افتح الفيديو من جديد");
@@ -3381,7 +3482,7 @@ function prefetchAhead(session, meta, headers) {
 
 app.get("/api/hls/:pid/seg/:idx", requireStudent, async (req, res) => {
   let session;
-  try { session = await getStreamSession(req.params.pid); assertStreamOwner(session, req); } catch (e) { return jsonError(res, e.status || 403, e.message || "غير مصرح"); }
+  try { assertPlayerOrigin(req); session = await getStreamSession(req.params.pid); assertStreamOwner(session, req); } catch (e) { return jsonError(res, e.status || 403, e.message || "غير مصرح"); }
   if (!session.src?.plainKey && session.src?.mode !== "thanawica") return jsonError(res, 404, "غير متاح");
   const idx = Number(req.params.idx);
   if (!Number.isFinite(idx) || idx < 0) return jsonError(res, 400, "طلب غير صالح");
@@ -4511,6 +4612,14 @@ setInterval(() => {
   for (const [k, s] of streamSessions) if (t - s.lastUsed > CONFIG.STREAM_IDLE_MS || t - s.createdAt > CONFIG.STREAM_MAX_MS) streamSessions.delete(k);
   for (const [k, s] of sharedPlayByVideo) {
     if (!s || t - (s.lastUsed || 0) > CONFIG.STREAM_IDLE_MS || t - (s.createdAt || 0) > CONFIG.STREAM_MAX_MS || !streamSessions.has(s.id)) sharedPlayByVideo.delete(k);
+  }
+  for (const [k, row] of playBurst) {
+    if (!row) { playBurst.delete(k); continue; }
+    if (row.bannedUntil && t > row.bannedUntil + 60_000) { playBurst.delete(k); continue; }
+    if (row.ids && row.ids.forEach) {
+      for (const [vid, ts] of [...row.ids.entries()]) if (t - ts > PLAY_BURST_WINDOW_MS) row.ids.delete(vid);
+      if (!row.ids.size && !(row.bannedUntil > t)) playBurst.delete(k);
+    }
   }
   for (const [k, e] of sourceCache) if (t > e.exp + 60_000) sourceCache.delete(k);
   for (const [k, e] of upCache) if (t > e.stale) upCache.delete(k);
